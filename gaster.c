@@ -196,6 +196,29 @@ sleep_ms(unsigned ms) {
 #endif
 }
 
+/* Microsecond-precision counterpart to sleep_ms() above, needed for
+ * checkm8_stage_setup()'s precise abort timing below -- see that
+ * function's own comment for why a whole-millisecond helper isn't
+ * precise enough there. Deliberately a busy-spin on CLOCK_MONOTONIC
+ * (a vDSO call, no syscall) rather than nanosleep(): even on a modern
+ * hrtimer-backed kernel, an actual sleep still pays real scheduler
+ * wakeup latency, plus Linux adds up to 50us of default per-process
+ * timer slack on top of that (coalescing short timers for power
+ * efficiency) -- both invisible at the API level but easily as large as
+ * the ~100us window this is used for. Spinning avoids both; the CPU
+ * cost of spinning for ~100us is negligible. */
+static void
+sleep_us(unsigned us) {
+	struct timespec start, now;
+	uint64_t target_ns = (uint64_t)us * 1000ULL, elapsed_ns;
+
+	clock_gettime(CLOCK_MONOTONIC, &start);
+	do {
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		elapsed_ns = (uint64_t)(now.tv_sec - start.tv_sec) * 1000000000ULL + (uint64_t)(now.tv_nsec - start.tv_nsec);
+	} while(elapsed_ns < target_ns);
+}
+
 #ifdef HAVE_LIBUSB
 static void
 close_usb_handle(usb_handle_t *handle) {
@@ -363,6 +386,77 @@ send_usb_control_request_async(const usb_handle_t *handle, uint8_t bm_request_ty
 		libusb_free_transfer(transfer);
 	}
 	return completed != 0;
+}
+
+/* Mirrors libirecovery's irecv_async_usb_control_transfer_with_cancel()
+ * exactly (used by this project's own original, pre-gaster hand-ported
+ * checkm8 implementation -- see docs/HISTORY.md) rather than
+ * send_usb_control_request_async() above: submit with no transfer-level
+ * timeout at all, sleep a single precise, fixed number of microseconds,
+ * then cancel once and block until that cancellation actually completes.
+ * send_usb_control_request_async() instead sweeps a millisecond-
+ * granularity range of abort timeouts, repeatedly cancelling inside
+ * libusb's own bounded event-polling loop -- a coarser technique than
+ * this single microsecond-precise shot. Used only by
+ * checkm8_stage_setup(), the one call site directly analogous to the
+ * original's own bug-setup/abort step; every other timing-sensitive call
+ * in this file is untouched. */
+static bool
+send_usb_control_request_async_precise_cancel(const usb_handle_t *handle, uint8_t bm_request_type, uint8_t b_request, uint16_t w_value, uint16_t w_index, void *p_data, size_t w_len, unsigned usleep_us, transfer_ret_t *transfer_ret) {
+	struct libusb_transfer *transfer = libusb_alloc_transfer(0);
+	int completed = 0;
+	uint8_t *buf;
+	bool ret = false;
+
+	if(transfer != NULL) {
+		if((buf = malloc(LIBUSB_CONTROL_SETUP_SIZE + w_len)) != NULL) {
+			if((bm_request_type & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_OUT) {
+				memcpy(buf + LIBUSB_CONTROL_SETUP_SIZE, p_data, w_len);
+			}
+			libusb_fill_control_setup(buf, bm_request_type, b_request, w_value, w_index, (uint16_t)w_len);
+			libusb_fill_control_transfer(transfer, handle->device, buf, usb_async_cb, &completed, 0);
+			if(libusb_submit_transfer(transfer) == LIBUSB_SUCCESS) {
+				sleep_us(usleep_us);
+				if(libusb_cancel_transfer(transfer) == LIBUSB_SUCCESS) {
+					while(completed == 0) {
+						libusb_handle_events_completed(NULL, &completed);
+					}
+					ret = true;
+					if((bm_request_type & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_IN) {
+						memcpy(p_data, libusb_control_transfer_get_data(transfer), transfer->actual_length);
+					}
+					if(transfer_ret != NULL) {
+						transfer_ret->sz = (uint32_t)transfer->actual_length;
+						if(transfer->status == LIBUSB_TRANSFER_COMPLETED || transfer->status == LIBUSB_TRANSFER_CANCELLED) {
+							transfer_ret->ret = USB_TRANSFER_OK;
+						} else if(transfer->status == LIBUSB_TRANSFER_STALL) {
+							transfer_ret->ret = USB_TRANSFER_STALL;
+						} else {
+							transfer_ret->ret = USB_TRANSFER_ERROR;
+						}
+					}
+				}
+			}
+			free(buf);
+		}
+		libusb_free_transfer(transfer);
+	}
+	return ret;
+}
+
+static bool
+send_usb_control_request_async_no_data_precise_cancel(const usb_handle_t *handle, uint8_t bm_request_type, uint8_t b_request, uint16_t w_value, uint16_t w_index, size_t w_len, unsigned usleep_us, transfer_ret_t *transfer_ret) {
+	bool ret = false;
+	void *p_data;
+
+	if(w_len == 0) {
+		ret = send_usb_control_request_async_precise_cancel(handle, bm_request_type, b_request, w_value, w_index, NULL, 0, usleep_us, transfer_ret);
+	} else if((p_data = malloc(w_len)) != NULL) {
+		memset(p_data, '\0', w_len);
+		ret = send_usb_control_request_async_precise_cancel(handle, bm_request_type, b_request, w_value, w_index, p_data, w_len, usleep_us, transfer_ret);
+		free(p_data);
+	}
+	return ret;
 }
 
 static void
@@ -939,17 +1033,25 @@ checkm8_stage_reset(const usb_handle_t *handle) {
 	return false;
 }
 
+/* usb_abort_timeout's millisecond-granularity sweep (see
+ * send_usb_control_request_async() above) is replaced here with the
+ * fixed, precise 100us abort delay this project's own original
+ * (pre-gaster) hand-ported checkm8 implementation used
+ * (irecv_async_usb_control_transfer_with_cancel(..., u_time=100) in the
+ * now-deleted DeviceManager.m -- see docs/HISTORY.md) via
+ * send_usb_control_request_async_no_data_precise_cancel(). The retry
+ * loop itself is unchanged -- still retries the identical shot on
+ * failure, same as before, just no longer varying the timeout value
+ * across attempts. */
 static bool
 checkm8_stage_setup(const usb_handle_t *handle) {
-	unsigned usb_abort_timeout = usb_timeout - 1;
 	transfer_ret_t transfer_ret;
 
 	for(;;) {
-		if(send_usb_control_request_async_no_data(handle, 0x21, DFU_DNLOAD, 0, 0, DFU_MAX_TRANSFER_SZ, usb_abort_timeout, &transfer_ret) && transfer_ret.sz < config_overwrite_pad && send_usb_control_request_no_data(handle, 0, 0, 0, 0, config_overwrite_pad - transfer_ret.sz, &transfer_ret) && transfer_ret.ret == USB_TRANSFER_STALL) {
+		if(send_usb_control_request_async_no_data_precise_cancel(handle, 0x21, DFU_DNLOAD, 0, 0, DFU_MAX_TRANSFER_SZ, 100, &transfer_ret) && transfer_ret.sz < config_overwrite_pad && send_usb_control_request_no_data(handle, 0, 0, 0, 0, config_overwrite_pad - transfer_ret.sz, &transfer_ret) && transfer_ret.ret == USB_TRANSFER_STALL) {
 			return true;
 		}
 		send_usb_control_request_no_data(handle, 0x21, DFU_DNLOAD, 0, 0, EP0_MAX_PACKET_SZ, NULL);
-		usb_abort_timeout = (usb_abort_timeout + 1) % (usb_timeout - usb_abort_timeout_min + 1) + usb_abort_timeout_min;
 	}
 	return false;
 }
@@ -1429,6 +1531,17 @@ gaster_checkm8(usb_handle_t *handle) {
 				stage = STAGE_RESET;
 			}
 			reset_usb_handle(handle);
+			/* This project's own original (pre-gaster) hand-ported
+			 * checkm8 implementation always slept 500ms after a reset
+			 * before reconnecting (usleep(500000) in the now-deleted
+			 * DeviceManager.m -- see docs/HISTORY.md); gaster's own
+			 * wait_usb_handle() had no settle time at all, hammering
+			 * libusb_open_device_with_vid_pid() the instant
+			 * reset_usb_handle() returned. Added here, after every
+			 * stage's reset regardless of which one just ran (the
+			 * original applied it selectively; this applies it
+			 * uniformly, the simpler-to-reason-about choice). */
+			sleep_ms(500);
 		} else {
 			stage = STAGE_PWNED;
 			puts("Now you can boot untrusted images.");
