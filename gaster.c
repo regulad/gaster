@@ -120,6 +120,12 @@ typedef struct {
 	uint16_t vid, pid;
 #ifdef HAVE_LIBUSB
 	struct libusb_device_handle *device;
+	/* Tracks whether wait_usb_handle() actually claimed interface 0 this
+	 * time around, so close_usb_handle() knows whether there's anything
+	 * to release -- the claim itself is conditional on the interface
+	 * genuinely existing in the active config descriptor, not attempted
+	 * unconditionally. See wait_usb_handle()'s own comment for why. */
+	bool interface_claimed;
 #else
 	io_service_t serv;
 	IOUSBDeviceInterface320 **device;
@@ -191,10 +197,14 @@ sleep_ms(unsigned ms) {
 #ifdef HAVE_LIBUSB
 static void
 close_usb_handle(usb_handle_t *handle) {
-	/* Mirror the claim in wait_usb_handle() below -- releasing before
-	 * close is what lets auto-detach-kernel-driver (also set up there)
-	 * reattach whatever kernel driver was bumped off this interface. */
-	libusb_release_interface(handle->device, 0);
+	/* Only release what wait_usb_handle() actually claimed -- claiming
+	 * is conditional there (see its own comment), so this must be too;
+	 * libusb_release_interface() on an interface that was never claimed
+	 * is a guaranteed error, not a harmless no-op. */
+	if(handle->interface_claimed) {
+		libusb_release_interface(handle->device, 0);
+		handle->interface_claimed = false;
+	}
 	libusb_close(handle->device);
 	libusb_exit(NULL);
 }
@@ -215,19 +225,47 @@ wait_usb_handle(usb_handle_t *handle, usb_check_cb_t usb_check_cb, void *arg) {
 				 * interface 0 (e.g. apple_mfi_fastcharge, which matches
 				 * this device even in DFU mode -- see docs/HISTORY.md)
 				 * before claiming it below, and reattach it automatically
-				 * once released in close_usb_handle(). Every control
-				 * transfer this file sends with an interface-recipient
-				 * bmRequestType (0x21, the DFU class requests used
-				 * throughout the exploit) was previously going out
-				 * unclaimed, which is exactly what triggered usbfs's own
-				 * "did not claim interface 0 before use" kernel warning. */
+				 * once released in close_usb_handle(). */
 				libusb_set_auto_detach_kernel_driver(handle->device, 1);
-				if(libusb_set_configuration(handle->device, 1) == LIBUSB_SUCCESS && libusb_claim_interface(handle->device, 0) == LIBUSB_SUCCESS) {
+				if(libusb_set_configuration(handle->device, 1) == LIBUSB_SUCCESS) {
+					/* Claim interface 0 -- but only if it actually exists
+					 * per the device's own (currently cached) active
+					 * config descriptor, checked explicitly first rather
+					 * than just trying the claim and treating any failure
+					 * as fatal. Confirmed against real hardware that the
+					 * config descriptor can come back genuinely truncated
+					 * (bNumInterfaces 0) mid-exploit, at which point
+					 * libusb_claim_interface() correctly, permanently
+					 * fails with LIBUSB_ERROR_INVALID_PARAM -- treating
+					 * that as a hard gate (as an earlier version of this
+					 * fix did) blocked wait_usb_handle() from ever
+					 * reaching usb_check_cb() below at all, turning a
+					 * transient/exploit-related descriptor state into a
+					 * permanent false "device not found". Every DFU class
+					 * request this file sends is still interface-
+					 * recipient (bmRequestType 0x21) regardless of
+					 * whether the claim below succeeds -- claiming when
+					 * possible is what fixes the "did not claim interface
+					 * 0 before use" kernel warning and lets auto-detach
+					 * handle a conflicting kernel driver; it was never
+					 * required for those requests to actually go out, the
+					 * same way upstream (which never claims at all)
+					 * already relies on. */
+					struct libusb_config_descriptor *config;
+					if(libusb_get_active_config_descriptor(libusb_get_device(handle->device), &config) == LIBUSB_SUCCESS) {
+						if(config->bNumInterfaces > 0 && libusb_claim_interface(handle->device, 0) == LIBUSB_SUCCESS) {
+							handle->interface_claimed = true;
+						}
+						libusb_free_config_descriptor(config);
+					}
 					if(usb_check_cb == NULL || usb_check_cb(handle, arg)) {
 						puts("Found the USB handle.");
 						return true;
 					}
-					libusb_release_interface(handle->device, 0);
+					if(handle->interface_claimed) {
+						libusb_release_interface(handle->device, 0);
+						handle->interface_claimed = false;
+					}
 				}
 				libusb_close(handle->device);
 			}
@@ -307,6 +345,7 @@ init_usb_handle(usb_handle_t *handle, uint16_t vid, uint16_t pid) {
 	handle->vid = vid;
 	handle->pid = pid;
 	handle->device = NULL;
+	handle->interface_claimed = false;
 }
 #else
 static void
