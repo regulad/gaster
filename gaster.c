@@ -52,10 +52,13 @@
 #define EXEC_MAGIC (0x6578656365786563ULL)
 #define MEMC_MAGIC (0x6D656D636D656D63ULL)
 #define USB_MAX_STRING_DESCRIPTOR_IDX (10)
-/* checkm8_stage_setup()'s fixed abort-cancel delay -- see that
+/* checkm8_stage_setup()'s fixed abort-cancel delay default -- see that
  * function's own comment and sleep_us() for why this is microseconds,
- * not milliseconds like usb_timeout/usb_abort_timeout_min. */
-#define CHECKM8_SETUP_CANCEL_DELAY_US (100U)
+ * not milliseconds like usb_timeout/usb_abort_timeout_min. Overridable
+ * at runtime via the CANCEL_DELAY_US environment variable (see main()) --
+ * the exact right value is hardware-timing-dependent, not something to
+ * hardcode with confidence across different hosts. */
+#define CHECKM8_SETUP_CANCEL_DELAY_US_DEFAULT (100U)
 
 #define LZSS_F (18)
 #define LZSS_N (4096)
@@ -176,7 +179,7 @@ static der_item_spec_t der_img4_item_specs[] = {
 	{ 4, DER_OCTET_STR, DER_FLAG_OPTIONAL },
 	{ 5, DER_SEQ, DER_FLAG_OPTIONAL }
 };
-static unsigned usb_timeout, usb_abort_timeout_min;
+static unsigned usb_timeout, usb_abort_timeout_min, checkm8_setup_cancel_delay_us;
 static struct {
 	uint8_t b_len, b_descriptor_type;
 	uint16_t bcd_usb;
@@ -1056,7 +1059,7 @@ checkm8_stage_setup(const usb_handle_t *handle) {
 	transfer_ret_t transfer_ret;
 
 	for(;;) {
-		if(send_usb_control_request_async_no_data_precise_cancel(handle, 0x21, DFU_DNLOAD, 0, 0, DFU_MAX_TRANSFER_SZ, CHECKM8_SETUP_CANCEL_DELAY_US, &transfer_ret) && transfer_ret.sz < config_overwrite_pad && send_usb_control_request_no_data(handle, 0, 0, 0, 0, config_overwrite_pad - transfer_ret.sz, &transfer_ret) && transfer_ret.ret == USB_TRANSFER_STALL) {
+		if(send_usb_control_request_async_no_data_precise_cancel(handle, 0x21, DFU_DNLOAD, 0, 0, DFU_MAX_TRANSFER_SZ, checkm8_setup_cancel_delay_us, &transfer_ret) && transfer_ret.sz < config_overwrite_pad && send_usb_control_request_no_data(handle, 0, 0, 0, 0, config_overwrite_pad - transfer_ret.sz, &transfer_ret) && transfer_ret.ret == USB_TRANSFER_STALL) {
 			return true;
 		}
 		send_usb_control_request_no_data(handle, 0x21, DFU_DNLOAD, 0, 0, EP0_MAX_PACKET_SZ, NULL);
@@ -1908,7 +1911,7 @@ gaster_reset(usb_handle_t *handle) {
 
 int
 main(int argc, char **argv) {
-	char *env_usb_timeout = getenv("USB_TIMEOUT"), *env_usb_abort_timeout_min = getenv("USB_ABORT_TIMEOUT_MIN");
+	char *env_usb_timeout = getenv("USB_TIMEOUT"), *env_usb_abort_timeout_min = getenv("USB_ABORT_TIMEOUT_MIN"), *env_cancel_delay_us = getenv("CANCEL_DELAY_US");
 	int ret = EXIT_FAILURE;
 	usb_handle_t handle;
 
@@ -1920,7 +1923,10 @@ main(int argc, char **argv) {
 		usb_abort_timeout_min = 0;
 	}
 	printf("usb_abort_timeout_min (ms): %u\n", usb_abort_timeout_min);
-	printf("cancel delay (us): %u\n", (unsigned)CHECKM8_SETUP_CANCEL_DELAY_US);
+	if(env_cancel_delay_us == NULL || sscanf(env_cancel_delay_us, "%u", &checkm8_setup_cancel_delay_us) != 1) {
+		checkm8_setup_cancel_delay_us = CHECKM8_SETUP_CANCEL_DELAY_US_DEFAULT;
+	}
+	printf("cancel delay (us): %u\n", checkm8_setup_cancel_delay_us);
 	if(argc == 2 && strcmp(argv[1], "reset") == 0) {
 		if(gaster_reset(&handle)) {
 			ret = 0;
@@ -1942,6 +1948,7 @@ main(int argc, char **argv) {
 		puts("env:");
 		puts("USB_TIMEOUT - USB timeout in ms");
 		puts("USB_ABORT_TIMEOUT_MIN - USB abort timeout minimum in ms");
+		puts("CANCEL_DELAY_US - checkm8 SETUP-stage abort-cancel delay in us");
 		puts("options:");
 		puts("reset - Reset DFU state");
 		puts("pwn - Put the device in pwned DFU mode");
