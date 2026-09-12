@@ -210,8 +210,11 @@ sleep_ms(unsigned ms) {
  * timer slack on top of that (coalescing short timers for power
  * efficiency) -- both invisible at the API level but easily as large as
  * the ~100us window this is used for. Spinning avoids both; the CPU
- * cost of spinning for ~100us is negligible. */
-static void
+ * cost of spinning for ~100us is negligible. Returns the real elapsed
+ * time in microseconds (not just the requested one) so callers can
+ * report how precise this actually was on real hardware, not just
+ * assume it. */
+static double
 sleep_us(unsigned us) {
 	struct timespec start, now;
 	uint64_t target_ns = (uint64_t)us * 1000ULL, elapsed_ns;
@@ -221,6 +224,7 @@ sleep_us(unsigned us) {
 		clock_gettime(CLOCK_MONOTONIC, &now);
 		elapsed_ns = (uint64_t)(now.tv_sec - start.tv_sec) * 1000000000ULL + (uint64_t)(now.tv_nsec - start.tv_nsec);
 	} while(elapsed_ns < target_ns);
+	return (double)elapsed_ns / 1000.0;
 }
 
 #ifdef HAVE_LIBUSB
@@ -420,7 +424,7 @@ send_usb_control_request_async_precise_cancel(const usb_handle_t *handle, uint8_
 			libusb_fill_control_setup(buf, bm_request_type, b_request, w_value, w_index, (uint16_t)w_len);
 			libusb_fill_control_transfer(transfer, handle->device, buf, usb_async_cb, &completed, 0);
 			if(libusb_submit_transfer(transfer) == LIBUSB_SUCCESS) {
-				sleep_us(usleep_us);
+				printf("actually \"slept\" (us): %.2f\n", sleep_us(usleep_us));
 				if(libusb_cancel_transfer(transfer) == LIBUSB_SUCCESS) {
 					while(completed == 0) {
 						libusb_handle_events_completed(NULL, &completed);
