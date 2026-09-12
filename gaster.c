@@ -191,6 +191,10 @@ sleep_ms(unsigned ms) {
 #ifdef HAVE_LIBUSB
 static void
 close_usb_handle(usb_handle_t *handle) {
+	/* Mirror the claim in wait_usb_handle() below -- releasing before
+	 * close is what lets auto-detach-kernel-driver (also set up there)
+	 * reattach whatever kernel driver was bumped off this interface. */
+	libusb_release_interface(handle->device, 0);
 	libusb_close(handle->device);
 	libusb_exit(NULL);
 }
@@ -206,9 +210,24 @@ wait_usb_handle(usb_handle_t *handle, usb_check_cb_t usb_check_cb, void *arg) {
 		printf("[libusb] Waiting for the USB handle with VID: 0x%" PRIX16 ", PID: 0x%" PRIX16 "\n", handle->vid, handle->pid);
 		for(;;) {
 			if((handle->device = libusb_open_device_with_vid_pid(NULL, handle->vid, handle->pid)) != NULL) {
-				if(libusb_set_configuration(handle->device, 1) == LIBUSB_SUCCESS && (usb_check_cb == NULL || usb_check_cb(handle, arg))) {
-					puts("Found the USB handle.");
-					return true;
+				/* Linux only (a no-op elsewhere per libusb's own docs):
+				 * have libusb detach whatever kernel driver is bound to
+				 * interface 0 (e.g. apple_mfi_fastcharge, which matches
+				 * this device even in DFU mode -- see docs/HISTORY.md)
+				 * before claiming it below, and reattach it automatically
+				 * once released in close_usb_handle(). Every control
+				 * transfer this file sends with an interface-recipient
+				 * bmRequestType (0x21, the DFU class requests used
+				 * throughout the exploit) was previously going out
+				 * unclaimed, which is exactly what triggered usbfs's own
+				 * "did not claim interface 0 before use" kernel warning. */
+				libusb_set_auto_detach_kernel_driver(handle->device, 1);
+				if(libusb_set_configuration(handle->device, 1) == LIBUSB_SUCCESS && libusb_claim_interface(handle->device, 0) == LIBUSB_SUCCESS) {
+					if(usb_check_cb == NULL || usb_check_cb(handle, arg)) {
+						puts("Found the USB handle.");
+						return true;
+					}
+					libusb_release_interface(handle->device, 0);
 				}
 				libusb_close(handle->device);
 			}
