@@ -52,6 +52,10 @@
 #define EXEC_MAGIC (0x6578656365786563ULL)
 #define MEMC_MAGIC (0x6D656D636D656D63ULL)
 #define USB_MAX_STRING_DESCRIPTOR_IDX (10)
+/* checkm8_stage_setup()'s fixed abort-cancel delay -- see that
+ * function's own comment and sleep_us() for why this is microseconds,
+ * not milliseconds like usb_timeout/usb_abort_timeout_min. */
+#define CHECKM8_SETUP_CANCEL_DELAY_US (100U)
 
 #define LZSS_F (18)
 #define LZSS_N (4096)
@@ -1048,7 +1052,7 @@ checkm8_stage_setup(const usb_handle_t *handle) {
 	transfer_ret_t transfer_ret;
 
 	for(;;) {
-		if(send_usb_control_request_async_no_data_precise_cancel(handle, 0x21, DFU_DNLOAD, 0, 0, DFU_MAX_TRANSFER_SZ, 100, &transfer_ret) && transfer_ret.sz < config_overwrite_pad && send_usb_control_request_no_data(handle, 0, 0, 0, 0, config_overwrite_pad - transfer_ret.sz, &transfer_ret) && transfer_ret.ret == USB_TRANSFER_STALL) {
+		if(send_usb_control_request_async_no_data_precise_cancel(handle, 0x21, DFU_DNLOAD, 0, 0, DFU_MAX_TRANSFER_SZ, CHECKM8_SETUP_CANCEL_DELAY_US, &transfer_ret) && transfer_ret.sz < config_overwrite_pad && send_usb_control_request_no_data(handle, 0, 0, 0, 0, config_overwrite_pad - transfer_ret.sz, &transfer_ret) && transfer_ret.ret == USB_TRANSFER_STALL) {
 			return true;
 		}
 		send_usb_control_request_no_data(handle, 0x21, DFU_DNLOAD, 0, 0, EP0_MAX_PACKET_SZ, NULL);
@@ -1907,11 +1911,12 @@ main(int argc, char **argv) {
 	if(env_usb_timeout == NULL || sscanf(env_usb_timeout, "%u", &usb_timeout) != 1 || usb_timeout < 1) {
 		usb_timeout = 5;
 	}
-	printf("usb_timeout: %u\n", usb_timeout);
+	printf("usb_timeout (ms): %u\n", usb_timeout);
 	if(env_usb_abort_timeout_min == NULL || sscanf(env_usb_abort_timeout_min, "%u", &usb_abort_timeout_min) != 1 || usb_abort_timeout_min > usb_timeout) {
 		usb_abort_timeout_min = 0;
 	}
-	printf("usb_abort_timeout_min: %u\n", usb_abort_timeout_min);
+	printf("usb_abort_timeout_min (ms): %u\n", usb_abort_timeout_min);
+	printf("cancel delay (us): %u\n", (unsigned)CHECKM8_SETUP_CANCEL_DELAY_US);
 	if(argc == 2 && strcmp(argv[1], "reset") == 0) {
 		if(gaster_reset(&handle)) {
 			ret = 0;
