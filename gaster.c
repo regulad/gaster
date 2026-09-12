@@ -1281,12 +1281,13 @@ gaster_checkm8(usb_handle_t *handle) {
 		STAGE_SPRAY,
 		STAGE_PATCH,
 		STAGE_PWNED
-	} stage = STAGE_RESET;
+	} stage = STAGE_RESET, completed_stage;
 	bool ret, pwned;
 
 	init_usb_handle(handle, APPLE_VID, DFU_MODE_PID);
 	while(stage != STAGE_PWNED && wait_usb_handle(handle, checkm8_check_usb_device, &pwned)) {
 		if(!pwned) {
+			completed_stage = stage;
 			if(stage == STAGE_RESET) {
 				puts("Stage: RESET");
 				ret = checkm8_stage_reset(handle);
@@ -1315,7 +1316,30 @@ gaster_checkm8(usb_handle_t *handle) {
 				puts("ret: false");
 				stage = STAGE_RESET;
 			}
-			reset_usb_handle(handle);
+			/* Linux-only change: unlike RESET and PATCH (which both end by
+			 * putting the device into DFU_STATE_MANIFEST_WAIT_RESET via
+			 * dfu_set_state_wait_reset()/dfu_check_status(), a real
+			 * protocol state that requires a bus reset to advance out of),
+			 * SETUP and SPRAY are pure host-side control-transfer races
+			 * with no such protocol requirement -- their own last request
+			 * is a plain STALL probe / DFU_CLR_STATUS, not a manifest/reset
+			 * wait. The unconditional reset_usb_handle() below is only
+			 * precautionary for those two, and on Linux that precautionary
+			 * host-triggered libusb_reset_device() has been observed to
+			 * race this device's own USB core re-enumeration hard enough
+			 * to corrupt it (garbled descriptors, "can't set config",
+			 * never reconnecting) rather than cleanly reappearing -- see
+			 * this project's docs/HISTORY.md for the dmesg evidence this
+			 * is patched against. Skipping it on a successful SETUP/SPRAY
+			 * transition lets the next stage's own wait_usb_handle() just
+			 * reconnect to the still-present device instead of forcing an
+			 * unnecessary bus reset. A failed stage (ret == false) always
+			 * falls back to STAGE_RESET and still gets the real reset
+			 * below, same as upstream -- that recovery path genuinely
+			 * wants a clean device state before retrying from scratch. */
+			if(!(ret && (completed_stage == STAGE_SETUP || completed_stage == STAGE_SPRAY))) {
+				reset_usb_handle(handle);
+			}
 		} else {
 			stage = STAGE_PWNED;
 			puts("Now you can boot untrusted images.");
