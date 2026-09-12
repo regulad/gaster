@@ -19,11 +19,13 @@
 #	include <stdbool.h>
 #	include <string.h>
 #	include <stddef.h>
+#	include <time.h>
 #else
 #	include <CommonCrypto/CommonCrypto.h>
 #	include <CoreFoundation/CoreFoundation.h>
 #	include <IOKit/IOCFPlugIn.h>
 #	include <IOKit/usb/IOUSBLib.h>
+#	include <time.h>
 #endif
 
 #define DFU_DNLOAD (1)
@@ -214,10 +216,24 @@ reset_usb_handle(const usb_handle_t *handle) {
 	libusb_reset_device(handle->device);
 }
 
+/* label is purely diagnostic (identifies which caller/stage is waiting, in
+ * logging only); timeout_s bounds the wait (0 = wait forever, the original
+ * behavior every non-checkm8 caller still gets). Added directly in response
+ * to real-hardware testing showing gaster cycling through full
+ * RESET->SETUP->SPRAY->PATCH attempts with wildly inconsistent results
+ * (sometimes a clean full pass, sometimes stuck for good after SETUP or
+ * SPRAY) -- an unbounded wait here gives no way to tell, from the log
+ * alone, whether a given run is still making progress or has genuinely
+ * given up on a particular reconnect. See docs/HISTORY.md for the
+ * investigation this was added for. */
 static bool
-wait_usb_handle(usb_handle_t *handle, usb_check_cb_t usb_check_cb, void *arg) {
+wait_usb_handle(usb_handle_t *handle, usb_check_cb_t usb_check_cb, void *arg, const char *label, unsigned timeout_s) {
 	if(libusb_init(NULL) == LIBUSB_SUCCESS) {
-		printf("[libusb] Waiting for the USB handle with VID: 0x%" PRIX16 ", PID: 0x%" PRIX16 "\n", handle->vid, handle->pid);
+		struct timespec start_ts, now_ts;
+		double elapsed_s;
+
+		clock_gettime(CLOCK_MONOTONIC, &start_ts);
+		printf("[libusb] Waiting for the USB handle with VID: 0x%" PRIX16 ", PID: 0x%" PRIX16 " (%s)\n", handle->vid, handle->pid, label);
 		for(;;) {
 			if((handle->device = libusb_open_device_with_vid_pid(NULL, handle->vid, handle->pid)) != NULL) {
 				/* Linux only (a no-op elsewhere per libusb's own docs):
@@ -268,6 +284,15 @@ wait_usb_handle(usb_handle_t *handle, usb_check_cb_t usb_check_cb, void *arg) {
 					}
 				}
 				libusb_close(handle->device);
+			}
+			if(timeout_s != 0) {
+				clock_gettime(CLOCK_MONOTONIC, &now_ts);
+				elapsed_s = (double)(now_ts.tv_sec - start_ts.tv_sec) + (double)(now_ts.tv_nsec - start_ts.tv_nsec) / 1e9;
+				if(elapsed_s >= (double)timeout_s) {
+					printf("[libusb] Timed out after %.1fs waiting for the USB handle (%s).\n", elapsed_s, label);
+					libusb_exit(NULL);
+					return false;
+				}
 			}
 			sleep_ms(usb_timeout);
 		}
@@ -406,14 +431,17 @@ open_usb_device(io_service_t serv, usb_handle_t *handle) {
 }
 
 static bool
-wait_usb_handle(usb_handle_t *handle, usb_check_cb_t usb_check_cb, void *arg) {
+wait_usb_handle(usb_handle_t *handle, usb_check_cb_t usb_check_cb, void *arg, const char *label, unsigned timeout_s) {
 	CFMutableDictionaryRef matching_dict;
 	const char *darwin_device_class;
 	io_iterator_t iter;
 	io_service_t serv;
 	bool ret = false;
+	struct timespec start_ts, now_ts;
+	double elapsed_s;
 
-	printf("[IOKit] Waiting for the USB handle with VID: 0x%" PRIX16 ", PID: 0x%" PRIX16 "\n", handle->vid, handle->pid);
+	clock_gettime(CLOCK_MONOTONIC, &start_ts);
+	printf("[IOKit] Waiting for the USB handle with VID: 0x%" PRIX16 ", PID: 0x%" PRIX16 " (%s)\n", handle->vid, handle->pid, label);
 #if TARGET_OS_IPHONE
 	darwin_device_class = "IOUSBHostDevice";
 #else
@@ -436,6 +464,14 @@ wait_usb_handle(usb_handle_t *handle, usb_check_cb_t usb_check_cb, void *arg) {
 			IOObjectRelease(iter);
 			if(ret) {
 				break;
+			}
+			if(timeout_s != 0) {
+				clock_gettime(CLOCK_MONOTONIC, &now_ts);
+				elapsed_s = (double)(now_ts.tv_sec - start_ts.tv_sec) + (double)(now_ts.tv_nsec - start_ts.tv_nsec) / 1e9;
+				if(elapsed_s >= (double)timeout_s) {
+					printf("[IOKit] Timed out after %.1fs waiting for the USB handle (%s).\n", elapsed_s, label);
+					return false;
+				}
 			}
 			sleep_ms(usb_timeout);
 		}
@@ -1331,19 +1367,38 @@ checkm8_stage_patch(const usb_handle_t *handle) {
 	return ret;
 }
 
+typedef enum {
+	STAGE_RESET,
+	STAGE_SETUP,
+	STAGE_SPRAY,
+	STAGE_PATCH,
+	STAGE_PWNED
+} checkm8_stage_t;
+
+/* Named purely for wait_usb_handle()'s diagnostic label -- see its own
+ * comment. At the point gaster_checkm8()'s loop calls wait_usb_handle(),
+ * `stage` already holds whichever stage is about to run once the device
+ * reconnects (updated at the end of the previous iteration), so this
+ * reports it as "waiting to run <X>", not "waiting after <X>". */
+static const char *
+checkm8_stage_name(checkm8_stage_t stage) {
+	switch(stage) {
+		case STAGE_RESET: return "about to run RESET";
+		case STAGE_SETUP: return "about to run SETUP";
+		case STAGE_SPRAY: return "about to run SPRAY";
+		case STAGE_PATCH: return "about to run PATCH";
+		case STAGE_PWNED: return "confirming PWNED";
+		default: return "unknown stage";
+	}
+}
+
 static bool
 gaster_checkm8(usb_handle_t *handle) {
-	enum {
-		STAGE_RESET,
-		STAGE_SETUP,
-		STAGE_SPRAY,
-		STAGE_PATCH,
-		STAGE_PWNED
-	} stage = STAGE_RESET;
+	checkm8_stage_t stage = STAGE_RESET;
 	bool ret, pwned;
 
 	init_usb_handle(handle, APPLE_VID, DFU_MODE_PID);
-	while(stage != STAGE_PWNED && wait_usb_handle(handle, checkm8_check_usb_device, &pwned)) {
+	while(stage != STAGE_PWNED && wait_usb_handle(handle, checkm8_check_usb_device, &pwned, checkm8_stage_name(stage), 60)) {
 		if(!pwned) {
 			if(stage == STAGE_RESET) {
 				puts("Stage: RESET");
@@ -1587,7 +1642,7 @@ gaster_command(usb_handle_t *handle, void *request_data, size_t request_len, uin
 	transfer_ret_t transfer_ret;
 	bool ret = false;
 
-	if(wait_usb_handle(handle, NULL, NULL)) {
+	if(wait_usb_handle(handle, NULL, NULL, "gaster_command", 0)) {
 		if(dfu_send_data(handle, request_data, request_len) && (*response = malloc(response_len)) != NULL) {
 			if(send_usb_control_request(handle, 0xA1, 2, 0xFFFF, 0, *response, response_len, &transfer_ret) && transfer_ret.ret == USB_TRANSFER_OK && transfer_ret.sz == response_len) {
 				ret = true;
@@ -1721,7 +1776,7 @@ gaster_decrypt_file(usb_handle_t *handle, const char *src_filename, const char *
 static bool
 gaster_reset(usb_handle_t *handle) {
 	init_usb_handle(handle, APPLE_VID, DFU_MODE_PID);
-	if(wait_usb_handle(handle, NULL, NULL)) {
+	if(wait_usb_handle(handle, NULL, NULL, "reset", 0)) {
 		send_usb_control_request_no_data(handle, 0x21, DFU_CLR_STATUS, 0, 0, 0, NULL);
 		reset_usb_handle(handle);
 		close_usb_handle(handle);
