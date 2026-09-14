@@ -656,6 +656,53 @@ send_usb_control_request_async(const usb_handle_t *handle, uint8_t bm_request_ty
 	return false;
 }
 
+/* IOKit counterpart to the libusb-side send_usb_control_request_async_precise_cancel()
+ * above (see that function's own comment for the full rationale) -- was
+ * missing entirely on this branch, which left checkm8_stage_setup() (used
+ * unconditionally, not itself #ifdef-gated) calling an undeclared function
+ * on Darwin. completionTimeout/noDataTimeout are set to 0 (no IOKit-level
+ * timeout at all), not usb_timeout like send_usb_control_request_async()
+ * above -- the whole point of the "precise cancel" variant is that only
+ * the single, explicitly-timed USBDeviceAbortPipeZero() call below ends
+ * the transfer, not a race against IOKit's own expiring timeout, exactly
+ * mirroring the libusb version's transfer submitted with timeout 0. */
+static bool
+send_usb_control_request_async_precise_cancel(const usb_handle_t *handle, uint8_t bm_request_type, uint8_t b_request, uint16_t w_value, uint16_t w_index, void *p_data, size_t w_len, unsigned usleep_us, transfer_ret_t *transfer_ret) {
+	IOUSBDevRequestTO req;
+
+	req.wLenDone = 0;
+	req.pData = p_data;
+	req.bRequest = b_request;
+	req.bmRequestType = bm_request_type;
+	req.wLength = OSSwapLittleToHostInt16(w_len);
+	req.wValue = OSSwapLittleToHostInt16(w_value);
+	req.wIndex = OSSwapLittleToHostInt16(w_index);
+	req.completionTimeout = req.noDataTimeout = 0;
+	if((*handle->device)->DeviceRequestAsyncTO(handle->device, &req, usb_async_cb, transfer_ret) == kIOReturnSuccess) {
+		printf("actually \"slept\" (us): %.2f\n", sleep_us(usleep_us));
+		if((*handle->device)->USBDeviceAbortPipeZero(handle->device) == kIOReturnSuccess) {
+			CFRunLoopRun();
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+send_usb_control_request_async_no_data_precise_cancel(const usb_handle_t *handle, uint8_t bm_request_type, uint8_t b_request, uint16_t w_value, uint16_t w_index, size_t w_len, unsigned usleep_us, transfer_ret_t *transfer_ret) {
+	bool ret = false;
+	void *p_data;
+
+	if(w_len == 0) {
+		ret = send_usb_control_request_async_precise_cancel(handle, bm_request_type, b_request, w_value, w_index, NULL, 0, usleep_us, transfer_ret);
+	} else if((p_data = malloc(w_len)) != NULL) {
+		memset(p_data, '\0', w_len);
+		ret = send_usb_control_request_async_precise_cancel(handle, bm_request_type, b_request, w_value, w_index, p_data, w_len, usleep_us, transfer_ret);
+		free(p_data);
+	}
+	return ret;
+}
+
 static void
 init_usb_handle(usb_handle_t *handle, uint16_t vid, uint16_t pid) {
 	handle->vid = vid;
